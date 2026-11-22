@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#0b0f17">
+<title>منصة تداول الذكية — 94 محللاً</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css?v=1">
+<script src="/static/vendor/lightweight-charts.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/"><span class="logo">◆</span><span>منصة تداول الذكية</span><small id="nAgents">94 محللاً</small></a>
+  <div class="searchwrap">
+    <input id="search" type="search" autocomplete="off" placeholder="ابحث عن أي سهم: أرامكو، Apple، 2222، TSLA، Emaar…">
+    <div id="results" class="results hidden"></div>
+  </div>
+  <nav class="links"><a href="#/">الرئيسية</a><a href="#/tv">ربط TradingView</a></nav>
+</header>
+<div id="tape" class="tape"></div>
+<main id="view"></main>
+<footer class="foot">
+  ⚠️ هذه المنصة أداة تحليل آلية <b>تعليمية</b> وليست استشارة مالية مرخّصة ولا توصية بالشراء أو البيع. الأسعار من Yahoo Finance وقد تتأخر،
+  والصفقات المعروضة <b>ورقية (محاكاة)</b> وليست صفقات منفّذة. ويدجت TradingView مقدَّمة من TradingView. القرار مسؤوليتك.
+</footer>
+
+<button id="chatBtn" class="chatbtn" aria-label="بوت تداول">💬 <span>بوت تداول</span></button>
+<aside id="chat" class="chat hidden" aria-label="بوت تداول">
+  <div class="chathead"><b>🤖 بوت تداول</b><span id="chatCtx" class="muted"></span><button id="chatClose" class="x">✕</button></div>
+  <div id="chatLog" class="chatlog"></div>
+  <div class="chips" id="chatChips"></div>
+  <form id="chatForm" class="chatform">
+    <input id="chatIn" autocomplete="off" placeholder="اسأل عن السهم المفتوح…">
+    <button>إرسال</button>
+  </form>
+  <label id="fwdWrap" class="fwd hidden"><input type="checkbox" id="fwd"> أرسل لتداول في Grok Bot</label>
+</aside>
+
+<div id="modal" class="modal hidden"><div class="modalbox"><div class="modalhead"><b id="modalTitle"></b><button class="x" id="modalClose">✕</button></div><div id="modalBody"></div></div></div>
+<script src="/static/app.js?v=2"></script>
+</body>
+</html>

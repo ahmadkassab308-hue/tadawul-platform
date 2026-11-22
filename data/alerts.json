@@ -1,0 +1,25 @@
+[
+ {
+  "id": "d4b11ec889",
+  "received_at": "2026-11-22 12:20",
+  "tv_ticker": "2222",
+  "tv_exchange": "TADAWUL",
+  "yahoo": "2222.SR",
+  "tv_price": 26.36,
+  "message": "اختبار تنبيه",
+  "interval": null,
+  "raw": "{\"ticker\":\"2222\",\"exchange\":\"TADAWUL\",\"price\":26.36,\"message\":\"اختبار تنبيه\"}",
+  "status": "done",
+  "verdict_ar": "شراء",
+  "verdict_en": "buy",
+  "confidence": 0.731,
+  "score": 0.297,
+  "price": 26.36,
+  "stop": 25.8596,
+  "t1": 27.0144,
+  "name": "أرامكو السعودية",
+  "analysed_at": "2026-11-22 12:20",
+  "currency": "SAR",
+  "forward": "not-configured"
+ }
+]
