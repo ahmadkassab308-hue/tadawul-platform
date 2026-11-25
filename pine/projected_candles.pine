@@ -1,0 +1,638 @@
+//@version=5
+// =============================================================================
+//  الشموع التوقعية — Projected Candles  (Gann · Square of 9 · Cycles 12/100)
+//  Made for Ahmad Kassab — Tadawul platform (github.com/ahmadkassab308-hue/tadawul-platform)
+// -----------------------------------------------------------------------------
+//  ⚠️ تنبيه مهم: هذا المؤشر يرسم "إسقاطاً احتمالياً" مبنياً على بيانات تاريخية
+//  ونماذج (جان، مربع التسعة، الدورات، الاتجاه). هو ليس تنبؤاً مؤكداً ولا توصية
+//  شراء أو بيع. الأسواق قد تتحرك عكس الإسقاط تماماً. استخدمه للتخطيط فقط.
+//
+//  DISCLAIMER: This is a PROBABILISTIC PROJECTION built from historical
+//  statistics and classical techniques (Gann angles/time, Square of 9, cycles,
+//  trend/mean-reversion). It is NOT a guarantee or financial advice.
+//  Future dates are approximate (weekends/holidays/sessions are estimated).
+// -----------------------------------------------------------------------------
+//  How it works (summary):
+//   projected log-price(k) = weighted average of directional components
+//        [drift+seasonality, Gann angle path, Square-of-9 target, trend+mean-reversion]
+//      + cycle overlay (sine fits for 12, 100, and user cycles)
+//      → then a Square-of-9 "magnet" makes price stall near Sq9 levels.
+//   OHLC per future bar: open = previous close, close = projected path,
+//   wicks = fraction of ATR scaled by projected volatility.
+// =============================================================================
+indicator("الشموع التوقعية — جان/مربع التسعة/الدورات (Projected Candles)", shorttitle = "Projected Candles", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_polylines_count = 20, max_bars_back = 1000)
+
+// ───────────────────────────── Constants ─────────────────────────────
+// CAP: TradingView allows drawing at most 500 bars into the future and at most
+// 500 boxes/lines/labels per script. Each candle uses 1 box + 1 line + 1 label,
+// and we keep ~20 objects for Gann/Sq9/time lines, so the cap is 480 candles.
+CAP      = 480
+DAY_MS   = 86400000
+
+U_BARS   = "شموع (Bars)"
+U_DAYS   = "أيام (Days)"
+U_WEEKS  = "أسابيع (Weeks)"
+U_MONTHS = "أشهر (Months)"
+U_YEARS  = "سنوات (Years)"
+
+W_AUTO   = "تلقائي (Auto)"
+W_SATSUN = "السبت-الأحد (Sat-Sun)"
+W_FRISAT = "الجمعة-السبت (Fri-Sat)"
+W_NONE   = "بدون (None)"
+
+// Exchanges whose weekend is Friday-Saturday (used by Auto weekend mode)
+FRI_SAT_EXCH = ",TADAWUL,EGX,QSE,KSE,BOURSAKUWAIT,BAHRAIN,BHB,MSM,MSX,"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+G_H = "① أفق التوقع (Horizon)"
+horizonAmt  = input.int(3, "المدة (Amount)", minval = 1, maxval = 100000, group = G_H, inline = "hz")
+horizonUnit = input.string(U_MONTHS, "", options = [U_BARS, U_DAYS, U_WEEKS, U_MONTHS, U_YEARS], group = G_H, inline = "hz", tooltip = "اختر مدة التوقع ووحدتها. تتحول تلقائياً إلى عدد شموع على الفريم الحالي.\nالحد الأقصى 480 شمعة مستقبلية لأن TradingView يسمح بالرسم 500 شمعة للأمام و500 صندوق/خط/ملصق فقط.\nللمدد الطويلة (سنة أو أكثر) استخدم الفريم الأسبوعي أو الشهري.\n(Converted to bars on the current timeframe; capped at 480 bars due to Pine 500-object / 500-future-bar limits. For long horizons use Weekly/Monthly charts.)")
+weekendOpt  = input.string(W_AUTO, "أيام العطلة (Weekend)", options = [W_AUTO, W_SATSUN, W_FRISAT, W_NONE], group = G_H, tooltip = "تُستخدم لحساب تواريخ الشموع اليومية المستقبلية. تلقائي: تداول والأسواق الخليجية = جمعة-سبت، الكريبتو = بدون، غيرها = سبت-أحد.\n(Used to estimate future daily-bar dates. Holidays are not known, so dates are approximate.)")
+lookback    = input.int(250, "فترة البيانات التاريخية (Lookback bars)", minval = 30, maxval = 900, group = G_H, tooltip = "عدد الشموع التاريخية لحساب متوسط العائد والتذبذب.\n(Bars used for mean log-return and volatility.)")
+
+G_D = "② الانحراف التاريخي والموسمية (Drift & Seasonality)"
+useDrift    = input.bool(true, "تفعيل (Enable)", group = G_D, inline = "d")
+wDrift      = input.float(1.0, "الوزن (Weight)", minval = 0, step = 0.1, group = G_D, inline = "d")
+driftShrink = input.float(0.5, "تقليص الانحراف (Drift shrink)", minval = 0, maxval = 2, step = 0.05, group = G_D, tooltip = "يضرب متوسط العائد التاريخي بهذا المعامل لتجنب المبالغة (0.5 = نصف الانحراف).\n(Multiplies historical mean return to avoid over-extrapolation.)")
+useSeason   = input.bool(true, "الموسمية الشهرية (Monthly seasonality)", group = G_D, inline = "s")
+seasW       = input.float(1.0, "القوة (Strength)", minval = 0, step = 0.1, group = G_D, inline = "s")
+
+G_G = "③ جان: الزوايا والزمن (Gann angles & time)"
+useGann     = input.bool(true, "تفعيل (Enable)", group = G_G, inline = "g")
+wGann       = input.float(1.0, "الوزن (Weight)", minval = 0, step = 0.1, group = G_G, inline = "g")
+pivotLen    = input.int(20, "طول القمة/القاع الرئيسي (Major pivot length)", minval = 3, maxval = 200, group = G_G, tooltip = "عدد الشموع يمين ويسار لتحديد آخر قمة أو قاع رئيسي تُرسم منه زوايا جان ومربع التسعة.\n(Bars left/right for the most recent major pivot.)")
+gannMult    = input.float(0.1, "مقياس جان: ATR لكل شمعة (Gann scale, ATR per bar)", minval = 0.005, step = 0.005, group = G_G, tooltip = "زاوية 1x1 = هذا الجزء من ATR لكل شمعة. 2x1 ضعفها و1x2 نصفها.\n(1x1 angle = this fraction of ATR per bar.)")
+gannDaysStr = input.string("30,45,60,90,120,144,180,270,360", "دورات جان الزمنية بالأيام (Time cycles, days)", group = G_G, tooltip = "ذكرى زمنية من آخر قمة/قاع (أيام تقويمية) تتكرر كل 360 يوم. تُعامل كنقاط انعطاف متوقعة.\n(Calendar-day anniversaries from the pivot, repeated every 360 days = expected turning points.)")
+gannFlip    = input.bool(true, "عكس مسار جان عند نقاط الانعطاف (Reverse at time turns)", group = G_G)
+gannMinGap  = input.int(5, "أقل فاصل بين الانعطافات (Min bars between turns)", minval = 1, group = G_G)
+
+G_S = "④ مربع التسعة (Square of 9)"
+useSq9      = input.bool(true, "تفعيل (Enable)", group = G_S, inline = "q")
+wSq9        = input.float(1.0, "الوزن (Weight)", minval = 0, step = 0.1, group = G_S, inline = "q")
+sq9Deg      = input.float(45.0, "خطوة الزاوية بالدرجات (Angle step °)", options = [22.5, 45.0, 90.0, 180.0, 360.0], group = G_S, tooltip = "المستوى = (√سعر القمة/القاع ± n × الخطوة)²، حيث 360° = 2 في الجذر، 45° = 0.25، 22.5° = 0.125.\n(Level = (sqrt(pivot) ± n·step)², 360° = 2 in sqrt units.)")
+sq9Magnet   = input.float(0.35, "قوة التوقف عند المستويات (Stall strength)", minval = 0, maxval = 1, step = 0.05, group = G_S, tooltip = "كم ينجذب السعر المتوقع لمستوى مربع التسعة القريب (0 = لا شيء، 1 = يلتصق).\n(How strongly projected price snaps/stalls at nearby Sq9 levels.)")
+sq9TolAtr   = input.float(0.5, "مدى الالتصاق × ATR (Snap range × ATR)", minval = 0, step = 0.1, group = G_S)
+sq9Auto     = input.bool(true, "تكبير تلقائي للأسعار الصغيرة (Auto-scale small prices)", group = G_S, tooltip = "للأسهم تحت 10 يُضرب السعر ×100 قبل الجذر حتى تكون المستويات منطقية.\n(Prices < 10 are scaled ×100, < 1 ×10000 before the square root.)")
+
+G_C = "⑤ الدورات 12 و100 (Cycles)"
+useCyc      = input.bool(true, "تفعيل (Enable)", group = G_C, inline = "c")
+wCyc        = input.float(1.0, "القوة (Amplitude)", minval = 0, step = 0.1, group = G_C, inline = "c")
+cycStr      = input.string("12,100", "أطوال الدورات بالشموع (Cycle lengths, bars)", group = G_C, tooltip = "افصل بفاصلة. مثال: 12,100,20,60. لكل دورة تُطابق موجة جيبية (طور وسعة) على آخر شموع ثم تُمدّ للمستقبل.\n(Comma-separated. Each cycle = sine wave fitted to recent detrended prices.)")
+
+G_T = "⑥ الاتجاه والارتداد للمتوسط (Trend & mean reversion)"
+useTrend    = input.bool(true, "تفعيل (Enable)", group = G_T, inline = "t")
+wTrend      = input.float(1.0, "الوزن (Weight)", minval = 0, step = 0.1, group = G_T, inline = "t")
+trendDecay  = input.int(60, "تلاشي الاتجاه بالشموع (Trend decay bars)", minval = 5, maxval = 1000, group = G_T, tooltip = "ميل EMA50 يُمدّ للأمام ويتلاشى تدريجياً بعد هذا العدد تقريباً. RSI يخفف أو يمدد الحركة، وتوافق EMA50/EMA200 يقويها.\n(EMA50 slope is extended then decays; RSI regime damps/extends; EMA50 vs EMA200 alignment boosts.)")
+mrHalfLife  = input.int(30, "نصف عمر الارتداد (Mean-reversion half-life)", minval = 2, maxval = 1000, group = G_T)
+mrWeight    = input.float(0.5, "قوة الارتداد لـ EMA50 (Mean-reversion strength)", minval = 0, maxval = 2, step = 0.05, group = G_T)
+
+G_V = "⑦ العرض (Display)"
+bodyW       = input.int(4, "عرض جسم الشمعة بالبكسل (Body width px)", minval = 1, maxval = 20, group = G_V, tooltip = "عدّلها حسب تكبير الشارت.\n(Adjust to your chart zoom.)")
+wickFrac    = input.float(0.35, "طول الذيل × ATR (Wick × ATR)", minval = 0, step = 0.05, group = G_V)
+showHover   = input.bool(true, "ملصق سعر عند المرور على كل شمعة (Hover price labels)", group = G_V)
+showBand    = input.bool(true, "نطاق الثقة (Confidence band)", group = G_V, inline = "b")
+bandZ       = input.float(1.0, "σ", minval = 0.1, step = 0.1, group = G_V, inline = "b", tooltip = "نطاق ±σ يتسع مع الجذر التربيعي للزمن. 1σ ≈ 68% احتمال.\n(±z·σ·√k band.)")
+showPath    = input.bool(false, "خط المسار المتوقع (Projected path line)", group = G_V)
+showGannL   = input.bool(true, "زوايا جان (Gann angle lines)", group = G_V)
+showSq9L    = input.bool(true, "مستويات مربع التسعة (Sq9 levels)", group = G_V)
+showTimeL   = input.bool(true, "خطوط نقاط الانعطاف الزمنية (Gann time lines)", group = G_V)
+showTable   = input.bool(true, "جدول الأسعار (Price table)", group = G_V)
+tablePos    = input.string("أعلى يمين (Top right)", "مكان الجدول (Table position)", options = ["أعلى يمين (Top right)", "أعلى يسار (Top left)", "أسفل يمين (Bottom right)", "أسفل يسار (Bottom left)"], group = G_V)
+showEmas    = input.bool(false, "إظهار EMA 50/200", group = G_V)
+
+G_K = "⑧ الألوان (Colors)"
+bullCol     = input.color(color.new(#26a69a, 0), "صاعدة (Bull)", group = G_K, inline = "k1")
+bearCol     = input.color(color.new(#ef5350, 0), "هابطة (Bear)", group = G_K, inline = "k1")
+wickCol     = input.color(color.new(#9e9e9e, 0), "الذيل (Wick)", group = G_K, inline = "k1")
+bandCol     = input.color(color.new(#2962ff, 30), "النطاق (Band)", group = G_K, inline = "k2")
+pathCol     = input.color(color.new(#ffeb3b, 0), "المسار (Path)", group = G_K, inline = "k2")
+gannCol     = input.color(color.new(#ff9800, 20), "جان (Gann)", group = G_K, inline = "k3")
+sq9Col      = input.color(color.new(#ab47bc, 30), "مربع9 (Sq9)", group = G_K, inline = "k3")
+timeCol     = input.color(color.new(#00bcd4, 40), "زمن (Time)", group = G_K, inline = "k3")
+
+G_L = "⑨ معرفة السعر في وقت محدد (Price lookup)"
+useTarget   = input.bool(true, "تفعيل (Enable)", group = G_L)
+targetTime  = input.time(timestamp("01 Jan 2027 00:00 +0300"), "التاريخ والوقت المستهدف (Target date/time)", group = G_L, tooltip = "اختر أي تاريخ داخل فترة التوقع، وسيظهر ملصق على المسار بالسعر المتوقع ونطاقه.\n(Pick any moment within the horizon; a label shows projected price and ±σ range.)")
+
+// ───────────────────────────── Helper functions ─────────────────────────────
+f_isWeekend(int t, int w1, int w2) =>
+    int d = dayofweek(t, syminfo.timezone)
+    d == w1 or d == w2
+
+f_fmtDate(int t) =>
+    timeframe.isintraday ? str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone) : str.format_time(t, "yyyy-MM-dd", syminfo.timezone)
+
+f_px(float p) =>
+    str.tostring(p, format.mintick)
+
+f_pct(float p, float base) =>
+    float ch = (p / base - 1.0) * 100.0
+    (ch >= 0 ? "+" : "") + str.tostring(ch, "0.00") + "%"
+
+// Parse "12,100,20" → array<int>
+f_parseInts(string s) =>
+    array<int> out = array.new_int()
+    array<string> parts = str.split(str.replace_all(s, " ", ""), ",")
+    int n = array.size(parts)
+    if n > 0
+        for i = 0 to n - 1
+            float v = str.tonumber(array.get(parts, i))
+            if not na(v) and v >= 1
+                array.push(out, int(math.round(v)))
+    out
+
+// Nearest level in a sorted array
+f_nearest(array<float> lv, float p) =>
+    float best = na
+    float bd = 1e100
+    int n = array.size(lv)
+    if n > 0
+        for i = 0 to n - 1
+            float d = math.abs(array.get(lv, i) - p)
+            if d < bd
+                bd := d
+                best := array.get(lv, i)
+    best
+
+// First level strictly above p (ascending array)
+f_above(array<float> lv, float p) =>
+    float res = na
+    int n = array.size(lv)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(lv, i) > p
+                res := array.get(lv, i)
+                break
+    res
+
+// First level strictly below p
+f_below(array<float> lv, float p) =>
+    float res = na
+    int n = array.size(lv)
+    if n > 0
+        for i = n - 1 to 0
+            if array.get(lv, i) < p
+                res := array.get(lv, i)
+                break
+    res
+
+f_pos(string s) =>
+    s == "أعلى يسار (Top left)" ? position.top_left : s == "أسفل يمين (Bottom right)" ? position.bottom_right : s == "أسفل يسار (Bottom left)" ? position.bottom_left : position.top_right
+
+// ───────────────────────────── Per-bar series (must run every bar) ─────────────────────────────
+float logret     = na(close[1]) ? na : math.log(close / close[1])
+float mu         = ta.sma(logret, lookback)          // mean log-return per bar
+float sigma      = ta.stdev(logret, lookback)        // volatility per bar
+float sigmaShort = ta.stdev(logret, 20)              // recent volatility (for wick scaling)
+float atrV       = ta.atr(14)
+float ema50      = ta.ema(close, 50)
+float ema200     = ta.ema(close, 200)
+float rsiV       = ta.rsi(close, 14)
+float emaSlope   = (math.log(ema50) - math.log(ema50[10])) / 10.0   // log-slope per bar
+
+plot(showEmas ? ema50 : na, "EMA 50", color.new(color.orange, 0))
+plot(showEmas ? ema200 : na, "EMA 200", color.new(color.blue, 0))
+
+// Seasonality: average log-return per calendar month (accumulated over all history)
+var array<float> seasSum = array.new_float(12, 0.0)
+var array<int>   seasCnt = array.new_int(12, 0)
+var float seasTot = 0.0
+var int   seasN   = 0
+if not na(logret)
+    int mIdx = month(time) - 1
+    array.set(seasSum, mIdx, array.get(seasSum, mIdx) + logret)
+    array.set(seasCnt, mIdx, array.get(seasCnt, mIdx) + 1)
+    seasTot += logret
+    seasN += 1
+
+// Most recent major pivot (high or low)
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float pivPrice = na
+var int   pivBar   = na
+var int   pivTime  = na
+var bool  pivIsLow = true
+if na(pivBar)
+    pivPrice := close
+    pivBar   := bar_index
+    pivTime  := time
+if not na(ph)
+    pivPrice := ph
+    pivBar   := bar_index - pivotLen
+    pivTime  := time[pivotLen]
+    pivIsLow := false
+if not na(pl)
+    pivPrice := pl
+    pivBar   := bar_index - pivotLen
+    pivTime  := time[pivotLen]
+    pivIsLow := true
+
+// Drawing object holders (deleted and redrawn on the last bar)
+var array<box>      gBoxes  = array.new_box()
+var array<line>     gLines  = array.new_line()
+var array<label>    gLabels = array.new_label()
+var array<polyline> gPolys  = array.new<polyline>()
+var table           gTable  = table.new(f_pos(tablePos), 2, 20, bgcolor = color.new(#131722, 10), border_color = color.new(#434651, 0), border_width = 1, frame_color = color.new(#434651, 0), frame_width = 1)
+
+// ───────────────────────────── Projection (last bar only) ─────────────────────────────
+if barstate.islast
+    // 0) clean old drawings
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    while array.size(gLines) > 0
+        line.delete(array.pop(gLines))
+    while array.size(gLabels) > 0
+        label.delete(array.pop(gLabels))
+    while array.size(gPolys) > 0
+        polyline.delete(array.pop(gPolys))
+    table.clear(gTable, 0, 0, 1, 19)
+
+    float P0   = close
+    float lp0  = math.log(P0)
+    float atr0 = math.max(nz(atrV, P0 * 0.02), P0 * 0.0005)
+    float sig  = math.max(nz(sigma, 0.02), 0.0001)
+    float sigS = nz(sigmaShort, sig)
+    float volRatio = math.min(math.max(sigS / sig, 0.5), 2.0)
+
+    // 1) Future timestamps (approximate) ------------------------------------------
+    string wm = weekendOpt
+    if weekendOpt == W_AUTO
+        wm := syminfo.type == "crypto" ? W_NONE : str.contains(FRI_SAT_EXCH, "," + syminfo.prefix + ",") ? W_FRISAT : W_SATSUN
+    int wk1 = wm == W_SATSUN ? dayofweek.saturday : wm == W_FRISAT ? dayofweek.friday : -1
+    int wk2 = wm == W_SATSUN ? dayofweek.sunday : wm == W_FRISAT ? dayofweek.saturday : -1
+    bool useWk = wk1 >= 0
+
+    int nAvg = math.min(bar_index, 200)
+    float avgBarMs = nAvg > 0 ? float(time - time[nAvg]) / nAvg : timeframe.in_seconds() * 1000.0
+    array<int> fTimes = array.new_int()
+    int tPrev = time
+    int y0 = year(time)
+    int m0 = month(time)
+    for k = 1 to CAP
+        int nt = tPrev
+        if timeframe.isdaily
+            for s = 1 to timeframe.multiplier
+                nt += DAY_MS
+                int guard = 0
+                while useWk and f_isWeekend(nt, wk1, wk2) and guard < 7
+                    nt += DAY_MS
+                    guard += 1
+        else if timeframe.isweekly
+            nt := time + k * 7 * DAY_MS * timeframe.multiplier
+        else if timeframe.ismonthly
+            int mi = (m0 - 1) + k * timeframe.multiplier
+            nt := timestamp(syminfo.timezone, y0 + math.floor(mi / 12.0), mi % 12 + 1, 1, 0, 0, 0)
+        else
+            // intraday: average real spacing of the last 200 bars (includes nights/weekends)
+            nt := time + int(math.round(k * avgBarMs))
+        array.push(fTimes, nt)
+        tPrev := nt
+
+    // 2) Horizon → number of future bars ------------------------------------------
+    int nWanted = 0
+    if horizonUnit == U_BARS
+        nWanted := horizonAmt
+    else
+        int unitMs = horizonUnit == U_DAYS ? DAY_MS : horizonUnit == U_WEEKS ? 7 * DAY_MS : horizonUnit == U_MONTHS ? int(30.4375 * DAY_MS) : int(365.25 * DAY_MS)
+        int endT = time + horizonAmt * unitMs
+        if endT > array.get(fTimes, CAP - 1)
+            nWanted := CAP + 1
+        else
+            for k = 1 to CAP
+                if array.get(fTimes, k - 1) <= endT
+                    nWanted := k
+                else
+                    break
+    int  N         = math.max(1, math.min(nWanted, CAP))
+    bool truncated = nWanted > CAP
+    int  endFT     = array.get(fTimes, N - 1)
+
+    // 3) Component A — historical drift + monthly seasonality ---------------------
+    //    Δ(k) = Σ_{j≤k} shrink·(μ + seasonal_excess(month_j))
+    array<float> dDrift = array.new_float(N + 1, 0.0)
+    float overallMu = seasN > 0 ? seasTot / seasN : 0.0
+    float accD = 0.0
+    for k = 1 to N
+        float sAdj = 0.0
+        if useSeason
+            int mk = month(array.get(fTimes, k - 1)) - 1
+            int cnt = array.get(seasCnt, mk)
+            sAdj := cnt > 5 ? (array.get(seasSum, mk) / cnt - overallMu) * seasW : 0.0
+        accD += driftShrink * (nz(mu) + sAdj)
+        array.set(dDrift, k, accD)
+
+    // 4) Component B — Gann angles from the last major pivot + Gann time turns -----
+    //    Price-per-bar scale = ATR × gannMult. 1x1 = 1 unit/bar, 2x1 = 2, 1x2 = 0.5.
+    //    The angle closest to the current price is the "active" angle; projection
+    //    continues along it and reverses at Gann time anniversaries.
+    float gScale   = atr0 * gannMult
+    int   bFromPiv = math.max(bar_index - pivBar, 1)
+    float gDir     = pivIsLow ? 1.0 : -1.0
+    float v2x1     = pivPrice + gDir * 2.0 * gScale * bFromPiv
+    float v1x1     = pivPrice + gDir * 1.0 * gScale * bFromPiv
+    float v1x2     = pivPrice + gDir * 0.5 * gScale * bFromPiv
+    float e21      = math.abs(P0 - v2x1)
+    float e11      = math.abs(P0 - v1x1)
+    float e12      = math.abs(P0 - v1x2)
+    float gRatio   = e21 < e11 and e21 < e12 ? 2.0 : e11 <= e12 ? 1.0 : 0.5
+    float gSign    = gDir
+    bool  gBroken  = pivIsLow ? P0 < v1x2 : P0 > v1x2      // price broke the flattest angle → trend reversal
+    if gBroken
+        gSign  := -gDir
+        gRatio := 0.5
+    string gAngleName = gRatio == 2.0 ? "2x1" : gRatio == 1.0 ? "1x1" : "1x2"
+
+    // Gann time turning points (calendar-day anniversaries from pivot, + n×360)
+    array<int>  gDays    = f_parseInts(gannDaysStr)
+    array<bool> turnFlag = array.new_bool(N + 1, false)
+    array<int>  turnTime = array.new_int(N + 1, 0)
+    int nGD = array.size(gDays)
+    if nGD > 0
+        for di = 0 to nGD - 1
+            int dd = array.get(gDays, di)
+            for rep = 0 to 4
+                int tt = pivTime + (dd + 360 * rep) * DAY_MS
+                if tt > time and tt <= endFT
+                    for k = 1 to N
+                        if array.get(fTimes, k - 1) >= tt
+                            if not array.get(turnFlag, k)
+                                array.set(turnFlag, k, true)
+                                array.set(turnTime, k, tt)
+                            break
+
+    array<float> dGann = array.new_float(N + 1, 0.0)
+    float gp = P0
+    float gs = gSign
+    int lastFlip = -100000
+    for k = 1 to N
+        if gannFlip and array.get(turnFlag, k) and k - lastFlip >= gannMinGap
+            gs := -gs
+            lastFlip := k
+        gp := math.max(gp + gs * gRatio * gScale, P0 * 0.05)
+        array.set(dGann, k, math.log(gp) - lp0)
+
+    // 5) Component C — trend context (EMA slope, RSI regime) + mean reversion -------
+    array<float> dTrend = array.new_float(N + 1, 0.0)
+    float slope  = nz(emaSlope)
+    float rsiNow = nz(rsiV, 50)
+    float regime = 1.0
+    if slope > 0
+        regime := rsiNow > 70 ? 0.4 : rsiNow >= 50 ? 1.0 : 0.6     // overbought → damp; bullish regime → full
+    else
+        regime := rsiNow < 30 ? 0.4 : rsiNow <= 50 ? 1.0 : 0.6
+    bool aligned = (slope > 0 and nz(ema50) > nz(ema200)) or (slope < 0 and nz(ema50) < nz(ema200))
+    regime := regime * (aligned ? 1.2 : 0.7)
+    float dev0 = na(ema50) ? 0.0 : math.log(P0 / ema50)            // distance from EMA50 (log)
+    float lam  = math.log(2.0) / mrHalfLife
+    for k = 1 to N
+        float trendPart = slope * regime * trendDecay * (1.0 - math.exp(-float(k) / trendDecay))
+        float mrPart    = -dev0 * mrWeight * (1.0 - math.exp(-lam * k))
+        array.set(dTrend, k, trendPart + mrPart)
+
+    // 6) Component D — cycles (12, 100, user): sine fit on detrended log price ------
+    //    For each length L: detrend last M=2L bars with linear regression, then
+    //    project residual r(t) ≈ A·cos(2πt/L) + B·sin(2πt/L) (discrete Fourier fit).
+    array<int>   cycLens = f_parseInts(cycStr)
+    array<float> dCyc    = array.new_float(N + 1, 0.0)
+    string cycInfo = ""
+    int nCL = array.size(cycLens)
+    if useCyc and nCL > 0
+        for ci = 0 to nCL - 1
+            int Lc = array.get(cycLens, ci)
+            int M  = math.min(math.max(2 * Lc, 24), math.min(bar_index, 900))
+            if Lc >= 2 and M >= Lc
+                float sx  = 0.0
+                float sy  = 0.0
+                float sxx = 0.0
+                float sxy = 0.0
+                for i = 0 to M - 1
+                    float xi = -i
+                    float yi = math.log(close[i])
+                    sx  += xi
+                    sy  += yi
+                    sxx += xi * xi
+                    sxy += xi * yi
+                float den = M * sxx - sx * sx
+                float bS  = den != 0 ? (M * sxy - sx * sy) / den : 0.0
+                float aS  = (sy - bS * sx) / M
+                float cA  = 0.0
+                float cB  = 0.0
+                for j = 0 to M - 1
+                    float xj  = -j
+                    float res = math.log(close[j]) - (aS + bS * xj)
+                    float thH = 2.0 * math.pi * xj / Lc
+                    cA += res * math.cos(thH)
+                    cB += res * math.sin(thH)
+                cA := 2.0 * cA / M
+                cB := 2.0 * cB / M
+                float c0    = cA                    // fitted value at the current bar (t = 0)
+                float prevV = c0
+                float prevD = 0.0
+                bool  found = false
+                for k = 1 to N
+                    float thF = 2.0 * math.pi * k / Lc
+                    float v   = cA * math.cos(thF) + cB * math.sin(thF)
+                    array.set(dCyc, k, array.get(dCyc, k) + (v - c0))
+                    float dv = v - prevV
+                    if not found and k > 1 and dv * prevD < 0
+                        found := true
+                        cycInfo += str.tostring(Lc) + ": " + (prevD > 0 ? "قمة (Top) " : "قاع (Bottom) ") + f_fmtDate(array.get(fTimes, k - 2)) + "  "
+                    prevD := dv
+                    prevV := v
+
+    // 7) Component E — Square of 9 levels from the pivot price -------------------
+    //    level(n) = (√(pivot·scale) + n·step)² / scale,  step = degrees/180
+    float sqScale = sq9Auto ? (pivPrice < 1 ? 10000.0 : pivPrice < 10 ? 100.0 : 1.0) : 1.0
+    float r0      = math.sqrt(pivPrice * sqScale)
+    float stp     = sq9Deg / 180.0
+    float spread  = math.exp(3.0 * sig * math.sqrt(N))
+    float pLo     = P0 / spread * 0.8
+    float pHi     = P0 * spread * 1.2
+    int   nLo     = math.floor((math.sqrt(pLo * sqScale) - r0) / stp) - 1
+    int   nHi     = math.ceil((math.sqrt(pHi * sqScale) - r0) / stp) + 1
+    if nHi - nLo > 400
+        int nNow = math.round((math.sqrt(P0 * sqScale) - r0) / stp)
+        nLo := nNow - 200
+        nHi := nNow + 200
+    array<float> sqLv = array.new_float()
+    for n = nLo to nHi
+        float sr = r0 + n * stp
+        if sr > 0
+            array.push(sqLv, sr * sr / sqScale)
+
+    // Sq9 target = next level in the direction of the other components
+    float dirScore = (useDrift ? wDrift * array.get(dDrift, N) : 0.0) + (useTrend ? wTrend * array.get(dTrend, N) : 0.0) + (useGann ? wGann * array.get(dGann, N) : 0.0)
+    float sqTarget = na
+    if dirScore > 0
+        sqTarget := f_above(sqLv, P0 + 0.1 * atr0)
+    else if dirScore < 0
+        sqTarget := f_below(sqLv, P0 - 0.1 * atr0)
+    array<float> dSq9 = array.new_float(N + 1, 0.0)
+    if not na(sqTarget) and sqTarget > 0
+        for k = 1 to N
+            array.set(dSq9, k, (math.log(sqTarget) - lp0) * (1.0 - math.exp(-3.0 * k / N)))
+
+    // 8) Blend → projected close path ---------------------------------------------
+    float wSum = (useDrift ? wDrift : 0.0) + (useGann ? wGann : 0.0) + (useSq9 ? wSq9 : 0.0) + (useTrend ? wTrend : 0.0)
+    array<float> pathC = array.new_float(N + 1, P0)
+    array<float> bandU = array.new_float(N + 1, P0)
+    array<float> bandL = array.new_float(N + 1, P0)
+    for k = 1 to N
+        float dSum = 0.0
+        if wSum > 0
+            float num = 0.0
+            if useDrift
+                num += wDrift * array.get(dDrift, k)
+            if useGann
+                num += wGann * array.get(dGann, k)
+            if useSq9
+                num += wSq9 * array.get(dSq9, k)
+            if useTrend
+                num += wTrend * array.get(dTrend, k)
+            dSum := num / wSum
+        if useCyc
+            dSum += wCyc * array.get(dCyc, k)
+        float pk = math.exp(lp0 + dSum)
+        // Square-of-9 magnet: price stalls near a level
+        if useSq9 and sq9Magnet > 0
+            float lvN = f_nearest(sqLv, pk)
+            if not na(lvN) and math.abs(pk - lvN) < sq9TolAtr * atr0
+                pk := pk + (lvN - pk) * sq9Magnet
+        array.set(pathC, k, pk)
+        float bw = bandZ * sig * math.sqrt(k)
+        array.set(bandU, k, pk * math.exp(bw))
+        array.set(bandL, k, pk * math.exp(-bw))
+
+    // 9) Draw the projected candles -----------------------------------------------
+    array<chart.point> ptsU = array.new<chart.point>()
+    array<chart.point> ptsL = array.new<chart.point>()
+    array<chart.point> ptsP = array.new<chart.point>()
+    array.push(ptsU, chart.point.from_index(bar_index, P0))
+    array.push(ptsL, chart.point.from_index(bar_index, P0))
+    array.push(ptsP, chart.point.from_index(bar_index, P0))
+    for k = 1 to N
+        int   x  = bar_index + k
+        float o  = array.get(pathC, k - 1)
+        float c  = array.get(pathC, k)
+        float bd = math.abs(c - o)
+        float vr = 1.0 + (volRatio - 1.0) * math.exp(-k / 20.0)      // recent vol fades to normal
+        float wk = wickFrac * atr0 * vr * math.max(0.3, 1.0 - 0.5 * bd / atr0)
+        float h  = math.max(o, c) + wk
+        float l  = math.max(math.min(o, c) - wk, 0.0)
+        color col = c >= o ? bullCol : bearCol
+        int   tk = array.get(fTimes, k - 1)
+        array.push(gLines, line.new(x, h, x, l, xloc = xloc.bar_index, color = wickCol, width = 1))
+        array.push(gBoxes, box.new(left = x, top = math.max(o, c), right = x, bottom = math.min(o, c), border_color = col, border_width = bodyW, bgcolor = col, xloc = xloc.bar_index))
+        if showHover
+            string tip = "📅 " + f_fmtDate(tk) + "  (#" + str.tostring(k) + ")\nفتح O: " + f_px(o) + "\nأعلى H: " + f_px(h) + "\nأدنى L: " + f_px(l) + "\nإغلاق C: " + f_px(c) + "  " + f_pct(c, P0) + "\nالنطاق ±σ: " + f_px(array.get(bandL, k)) + " – " + f_px(array.get(bandU, k))
+            array.push(gLabels, label.new(x = x, y = c, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = color.new(col, 85), style = label.style_circle, size = size.tiny, tooltip = tip))
+        array.push(ptsU, chart.point.from_index(x, array.get(bandU, k)))
+        array.push(ptsL, chart.point.from_index(x, array.get(bandL, k)))
+        array.push(ptsP, chart.point.from_index(x, c))
+    if showBand
+        array.push(gPolys, polyline.new(ptsU, curved = false, closed = false, xloc = xloc.bar_index, line_color = bandCol, line_style = line.style_dashed, line_width = 1))
+        array.push(gPolys, polyline.new(ptsL, curved = false, closed = false, xloc = xloc.bar_index, line_color = bandCol, line_style = line.style_dashed, line_width = 1))
+    if showPath
+        array.push(gPolys, polyline.new(ptsP, curved = false, closed = false, xloc = xloc.bar_index, line_color = pathCol, line_style = line.style_dotted, line_width = 1))
+
+    // Gann angle lines from the pivot to the end of the horizon
+    int xEnd = bar_index + N
+    if showGannL
+        for gi = 0 to 2
+            float rr = gi == 0 ? 2.0 : gi == 1 ? 1.0 : 0.5
+            string nm = gi == 0 ? "2x1" : gi == 1 ? "1x1" : "1x2"
+            float yEnd = pivPrice + gDir * rr * gScale * (xEnd - pivBar)
+            if yEnd > 0
+                array.push(gLines, line.new(pivBar, pivPrice, xEnd, yEnd, xloc = xloc.bar_index, color = gannCol, style = gi == 1 ? line.style_solid : line.style_dashed, width = 1))
+                array.push(gLabels, label.new(xEnd, yEnd, "Gann " + nm, xloc = xloc.bar_index, color = color.new(gannCol, 100), textcolor = gannCol, style = label.style_label_left, size = size.small))
+
+    // Square-of-9 levels: 3 above and 3 below the current price
+    float sqUp1 = f_above(sqLv, P0)
+    float sqDn1 = f_below(sqLv, P0)
+    if showSq9L
+        float lvA = P0
+        float lvB = P0
+        for q = 1 to 3
+            float ua = f_above(sqLv, lvA)
+            float db = f_below(sqLv, lvB)
+            if not na(ua)
+                array.push(gLines, line.new(bar_index, ua, xEnd, ua, xloc = xloc.bar_index, color = sq9Col, style = line.style_dotted, width = 1))
+                array.push(gLabels, label.new(xEnd, ua, "Sq9 " + f_px(ua), xloc = xloc.bar_index, color = color.new(sq9Col, 100), textcolor = sq9Col, style = label.style_label_left, size = size.tiny))
+                lvA := ua
+            if not na(db)
+                array.push(gLines, line.new(bar_index, db, xEnd, db, xloc = xloc.bar_index, color = sq9Col, style = line.style_dotted, width = 1))
+                array.push(gLabels, label.new(xEnd, db, "Sq9 " + f_px(db), xloc = xloc.bar_index, color = color.new(sq9Col, 100), textcolor = sq9Col, style = label.style_label_left, size = size.tiny))
+                lvB := db
+
+    // Gann time turning points: vertical dotted lines (max 8) + list for the table
+    string gTurns = ""
+    int nTurnsShown = 0
+    for k = 1 to N
+        if array.get(turnFlag, k)
+            if showTimeL and nTurnsShown < 8
+                array.push(gLines, line.new(bar_index + k, P0, bar_index + k, P0 * 1.01, xloc = xloc.bar_index, extend = extend.both, color = timeCol, style = line.style_dotted, width = 1))
+            if nTurnsShown < 3
+                gTurns += (nTurnsShown > 0 ? "  |  " : "") + f_fmtDate(array.get(fTimes, k - 1))
+            nTurnsShown += 1
+
+    // 10) Price lookup at a chosen date/time ---------------------------------------
+    string lookTxt = "—"
+    if useTarget
+        if targetTime <= time
+            lookTxt := "التاريخ في الماضي (date is in the past)"
+        else if targetTime > endFT
+            lookTxt := "خارج الأفق — زد المدة (beyond horizon, increase it)"
+        else
+            int kT = N
+            for k = 1 to N
+                if array.get(fTimes, k - 1) >= targetTime
+                    kT := k
+                    // pick the closer of k and k-1
+                    if k > 1 and (targetTime - array.get(fTimes, k - 2)) < (array.get(fTimes, k - 1) - targetTime)
+                        kT := k - 1
+                    break
+            float pT = array.get(pathC, kT)
+            string ttxt = "🎯 " + f_fmtDate(array.get(fTimes, kT - 1)) + "\nالسعر المتوقع: " + f_px(pT) + " (" + f_pct(pT, P0) + ")\nالنطاق: " + f_px(array.get(bandL, kT)) + " – " + f_px(array.get(bandU, kT))
+            array.push(gLabels, label.new(bar_index + kT, pT, ttxt, xloc = xloc.bar_index, color = color.new(#ffeb3b, 10), textcolor = color.black, style = label.style_label_down, size = size.normal))
+            lookTxt := f_fmtDate(array.get(fTimes, kT - 1)) + " → " + f_px(pT) + "  [" + f_px(array.get(bandL, kT)) + " – " + f_px(array.get(bandU, kT)) + "]"
+
+    // 11) Summary table ------------------------------------------------------------
+    if showTable
+        color hdr = color.new(#2962ff, 20)
+        color tc  = color.white
+        int row = 0
+        table.cell(gTable, 0, row, "الشموع التوقعية (Projected)", text_color = tc, bgcolor = hdr, text_size = size.small)
+        table.cell(gTable, 1, row, syminfo.ticker + " · " + timeframe.period, text_color = tc, bgcolor = hdr, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "الأفق (Horizon)", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, str.tostring(N) + " شمعة حتى " + f_fmtDate(endFT) + (truncated ? "  ⚠️ قُصّ إلى 480 (capped)" : ""), text_color = truncated ? color.orange : tc, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "السعر الحالي (Now)", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, f_px(P0), text_color = tc, text_size = size.small)
+        for qi = 1 to 4
+            int kq = math.max(1, math.min(N, int(math.round(N * qi / 4.0))))
+            float pq = array.get(pathC, kq)
+            row += 1
+            table.cell(gTable, 0, row, str.tostring(qi * 25) + "% → " + f_fmtDate(array.get(fTimes, kq - 1)), text_color = tc, text_size = size.small)
+            table.cell(gTable, 1, row, f_px(pq) + "  " + f_pct(pq, P0) + "  [" + f_px(array.get(bandL, kq)) + " – " + f_px(array.get(bandU, kq)) + "]", text_color = pq >= P0 ? bullCol : bearCol, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "🎯 السعر في التاريخ المختار (Lookup)", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, lookTxt, text_color = color.yellow, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "انعطافات جان الزمنية (Gann time turns)", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, gTurns == "" ? "لا يوجد ضمن الأفق (none in horizon)" : gTurns, text_color = timeCol, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "انعطاف الدورات (Cycle turns)", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, cycInfo == "" ? "—" : cycInfo, text_color = tc, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "مربع التسعة (Sq9) ↑ / ↓", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, (na(sqUp1) ? "—" : f_px(sqUp1)) + "  /  " + (na(sqDn1) ? "—" : f_px(sqDn1)) + (na(sqTarget) ? "" : "   هدف (target): " + f_px(sqTarget)), text_color = sq9Col, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "آخر " + (pivIsLow ? "قاع (Low)" : "قمة (High)") + " / زاوية جان", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, f_px(pivPrice) + " @ " + f_fmtDate(pivTime) + "  ·  " + gAngleName + (gBroken ? " (مكسورة broken)" : ""), text_color = gannCol, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "الاتجاه (Trend)", text_color = tc, text_size = size.small)
+        table.cell(gTable, 1, row, (slope > 0 ? "صاعد ↑" : "هابط ↓") + "  RSI " + str.tostring(rsiNow, "0") + "  ·  EMA50 " + (nz(ema50) > nz(ema200) ? ">" : "<") + " EMA200", text_color = tc, text_size = size.small)
+        row += 1
+        table.cell(gTable, 0, row, "⚠️ تنبيه", text_color = color.orange, text_size = size.tiny)
+        table.cell(gTable, 1, row, "إسقاط احتمالي وليس ضماناً — التواريخ تقريبية (probabilistic, not a guarantee)", text_color = color.orange, text_size = size.tiny)
